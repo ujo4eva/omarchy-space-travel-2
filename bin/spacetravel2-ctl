@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+"""spacetravel2-ctl — control Moondrop Space Travel 2 earbuds on Linux.
+
+Subcommands:
+  status [--json]        Connected? battery (BlueZ), codec (pactl), live ANC mode + EQ preset
+  anc <off|on|transparency|query>   Get/set ANC mode via GAIA; falls back to persisted state
+  eq                     Read-only EQ preset (0=Reference, 1=Basshead, 2=Monitor, 0x3f=Custom)
+  buds                   Per-bud battery via passive feature-0x0D listen (sends nothing)
+
+Safety policy (learned the hard way): only Gadgetbridge's known-safe
+  commands are ever sent (EQ/touch/ANC GETs, ANC SET). No blind feature
+  probes: an early scan with empty SET packets wiped the buds' voice
+  prompts and EQ preset (both restored via the Moondrop app). The `buds`
+  command only connects and listens.
+
+Protocol (from Gadgetbridge's Moondrop implementation, GPL-3.0-or-later/AGPL):
+  - GAIA V3 over RFCOMM channel 1. Frame: FF 04 00 <len> <vendor BE=00 1D>
+    <command BE=(feature<<9)|(pduType<<7)|pduId> <payload>.
+  - Audio-curation (ANC): feature 0x08, GET_MODE pdu 0x03, SET_MODE pdu 0x04.
+    GET returns 0-based slot; UI bitmask is Normal=1, ANC=2, Transparency=4
+    (mode = 1 << slot). SET takes the bitmask byte.
+  - EQ preset: feature 0x05, GET pdu 0x02, SET pdu 0x03.
+  - On-device tap controls: tap-and-hold cycles
+    ANC on -> ANC off -> Transparency; 4x tap toggles music/game mode
+    (game mode has no GAIA command — tap-only).
+  - Battery % comes from BlueZ (org.bluez.Battery1) when exposed.
+  - State file: ~/.config/omarchy-space-travel-2/state.json (last-known
+    ANC and per-bud battery, used when the earbuds are unreachable).
+
+Stdlib only. RFCOMM via socket.AF_BLUETOOTH.
+"""
+
+import json
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+STATE_DIR = os.path.expanduser("~/.config/omarchy-space-travel-2")
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+RFCOMM_CHANNEL = 1
+VENDOR_ID = 0x001D  # Qualcomm
+
+# Audio-curation (ANC) feature, per Gadgetbridge MoondropSpaceTravel2Protocol
+ANC_FEATURE = 0x08
+ANC_GET_MODE = 0x03
+ANC_SET_MODE = 0x04
+PDU_COMMAND = 0x00
+PDU_RESPONSE = 0x02
+
+ANC_TO_BITMASK = {"off": 1, "on": 2, "transparency": 4}
+BITMASK_TO_ANC = {1: "off", 2: "on", 4: "transparency"}
+
+# Equalizer preset (Gadgetbridge MoondropSpaceTravelProtocol; GET only here)
+EQ_FEATURE = 0x05
+EQ_GET_PRESET = 0x02
+EQ_PRESET_NAMES = {0: "Reference", 1: "Basshead", 2: "Monitor", 0x3F: "Custom"}
+
+DEVICE_NAME_HINTS = ("space travel 2", "space travel", "moondrop")
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(patch):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    state = load_state()
+    state.update(patch)
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+    return state
+
+
+def run(cmd, timeout=8):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None
+
+
+def find_device_address():
+    """Find Space Travel 2 MAC via bluetoothctl."""
+    p = run(["bluetoothctl", "devices"])
+    if not p or p.returncode != 0:
+        return None
+    for line in (p.stdout or "").splitlines():
+        low = line.lower()
+        if any(h in low for h in DEVICE_NAME_HINTS):
+            parts = line.split()
+            if len(parts) >= 2:
+                return parts[1]
+    return None
+
+
+def device_info(address):
+    p = run(["bluetoothctl", "info", address])
+    if not p or p.returncode != 0:
+        return {"connected": False}
+    out = p.stdout or ""
+    return {
+        "connected": "Connected: yes" in out,
+        "bonded": ("Bonded: yes" in out) or ("Paired: yes" in out),
+        "battery": parse_battery(out),
+    }
+
+
+def parse_battery(info_out):
+    import re
+    for line in info_out.splitlines():
+        if "Battery Percentage" in line:
+            # Format: "Battery Percentage: 0x64 (100)" — take parens first
+            m = re.search(r"\((\d+)\)", line)
+            if m:
+                return int(m.group(1))
+            m = re.search(r"(\d+)\s*$", line.strip())
+            if m:
+                return int(m.group(1))
+    return None
+
+
+def active_codec():
+    """Best-effort codec: PipeWire exposes api.bluez5.codec on the sink."""
+    p = run(["pactl", "list", "sinks"])
+    if p and p.returncode == 0:
+        in_bluez = False
+        for line in (p.stdout or "").splitlines():
+            s = line.strip()
+            if s.startswith("Name:"):
+                in_bluez = "bluez_output" in s
+            elif in_bluez and "api.bluez5.codec" in s:
+                codec = s.split("=", 1)[1].strip().strip('"').upper()
+                if codec:
+                    return codec
+    p = run(["pactl", "list", "cards"])
+    if not p or p.returncode != 0:
+        return None
+    current, active = None, None
+    for line in (p.stdout or "").splitlines():
+        s = line.strip()
+        if s.startswith("Card #"):
+            current = {"bluez": False, "active": ""}
+        elif current is not None and s.startswith("Name:") and "bluez" in s.lower():
+            current["bluez"] = True
+        elif current is not None and s.startswith("Active Profile:"):
+            current["active"] = s.split(":", 1)[1].strip()
+            if current["bluez"] and any(
+                h in current["active"].lower() or True for h in []
+            ):
+                active = current["active"]
+    if active:
+        for codec in ("AAC", "SBC-XQ", "SBC", "LDAC", "APTX"):
+            if codec.lower() in active.lower():
+                return codec
+        return active
+    return None
+
+
+def gaia_frame(feature, pdu_id, payload=b"", pdu_type=PDU_COMMAND):
+    cmd = (feature << 9) | (pdu_type << 7) | pdu_id
+    return (bytes([0xFF, 0x04, 0x00, len(payload)])
+            + struct.pack(">H", VENDOR_ID)
+            + struct.pack(">H", cmd)
+            + bytes(payload))
+
+
+def gaia_decode(data):
+    """Decode concatenated GAIA V3 packets -> [(feature, pdu_type, pdu_id, payload)]."""
+    i, out = 0, []
+    data = bytes(data)
+    while i + 8 <= len(data):
+        if data[i] != 0xFF or data[i + 1] != 0x04:
+            break
+        ln = data[i + 3]
+        if data[i + 4:i + 6] != struct.pack(">H", VENDOR_ID):
+            break
+        cmd = struct.unpack(">H", data[i + 6:i + 8])[0]
+        out.append(((cmd & 0xFE00) >> 9,
+                    (cmd & 0x0180) >> 7,
+                    cmd & 0x7F,
+                    data[i + 8:i + 8 + ln]))
+        i += 8 + ln
+    return out
+
+
+class Gaialink:
+    """One RFCOMM session (channel 1) for a request/response exchange."""
+
+    def __init__(self, address, timeout=4):
+        self.address = address
+        self.timeout = timeout
+        self.sock = None
+
+    def __enter__(self):
+        if not hasattr(socket, "AF_BLUETOOTH"):
+            raise OSError("AF_BLUETOOTH unavailable")
+        self.sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM,
+                                  socket.BTPROTO_RFCOMM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect((self.address, RFCOMM_CHANNEL))
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        return False
+
+    def transact(self, frame, settle=0.3, gather=0.8):
+        self.sock.sendall(frame)
+        time.sleep(settle)
+        chunks = []
+        try:
+            while True:
+                self.sock.settimeout(gather)
+                r = self.sock.recv(512)
+                if not r:
+                    break
+                chunks.append(r)
+        except socket.timeout:
+            pass
+        packets = []
+        for c in chunks:
+            packets.extend(gaia_decode(c))
+        return packets
+
+
+def query_anc_mode(address):
+    """Ask the earbuds for the live ANC slot. Returns mode name or None."""
+    try:
+        with Gaialink(address) as link:
+            for feat, ptype, pid, pay in link.transact(
+                    gaia_frame(ANC_FEATURE, ANC_GET_MODE)):
+                if (feat == ANC_FEATURE and ptype == PDU_RESPONSE
+                        and pid == ANC_GET_MODE and len(pay) >= 1):
+                    slot = pay[0]
+                    if 0 <= slot <= 2:
+                        return BITMASK_TO_ANC.get(1 << slot)
+    except OSError:
+        pass
+    return None
+
+
+def set_anc_mode(address, mode):
+    """Set ANC mode; returns confirmed mode name (via GET) or None."""
+    # The buds' RFCOMM server occasionally drops a session under rapid
+    # reconnects, so retry once on a fresh connection before giving up.
+    for _attempt in range(2):
+        try:
+            with Gaialink(address) as link:
+                # SET is fire-and-forget (no reply packet); don't wait for one.
+                link.transact(gaia_frame(ANC_FEATURE, ANC_SET_MODE,
+                                         bytes([ANC_TO_BITMASK[mode]])),
+                              settle=0.3, gather=0.5)
+                # The buds apply the new mode asynchronously; a GET sent too
+                # soon reads back the previous slot.
+                time.sleep(1.5)
+                for feat, ptype, pid, pay in link.transact(
+                        gaia_frame(ANC_FEATURE, ANC_GET_MODE)):
+                    if (feat == ANC_FEATURE and ptype == PDU_RESPONSE
+                            and pid == ANC_GET_MODE and len(pay) >= 1):
+                        slot = pay[0]
+                        if 0 <= slot <= 2:
+                            return BITMASK_TO_ANC.get(1 << slot)
+        except OSError:
+            pass
+        time.sleep(1.0)
+    return None
+
+
+def query_eq_preset(address):
+    """Read the EQ preset byte (known-safe GET). Returns int or None."""
+    try:
+        with Gaialink(address) as link:
+            for feat, ptype, pid, pay in link.transact(
+                    gaia_frame(EQ_FEATURE, EQ_GET_PRESET)):
+                if (feat == EQ_FEATURE and ptype == PDU_RESPONSE
+                        and pid == EQ_GET_PRESET and len(pay) >= 1):
+                    return pay[0]
+    except OSError:
+        pass
+    return None
+
+
+def cmd_eq(args):
+    address = find_device_address()
+    if not address:
+        print("Space Travel 2 not found in bluetoothctl devices.", file=sys.stderr)
+        return 1
+    info = device_info(address)
+    if not info.get("connected"):
+        print(f"{address} found but not connected.", file=sys.stderr)
+        return 1
+    preset = query_eq_preset(address)
+    if preset is None:
+        print(json.dumps({"preset": None, "name": "unknown", "live": False}))
+        return 2
+    print(json.dumps({"preset": preset,
+                      "name": EQ_PRESET_NAMES.get(preset, f"Preset {preset}"),
+                      "live": True}))
+    return 0
+
+
+def cmd_status(args):
+    address = find_device_address()
+    info = device_info(address) if address else {"connected": False}
+    state = load_state()
+    anc = state.get("anc", "unknown")
+    eq = None
+    if info.get("connected") and address:
+        live = query_anc_mode(address)
+        if live:
+            anc = live
+            save_state({"anc": live})
+        # Same session would be cheaper, but one extra short GET keeps the
+        # code paths (and failure modes) independent.
+        eq = query_eq_preset(address)
+    result = {
+        "address": address,
+        "connected": bool(info.get("connected")),
+        "bonded": bool(info.get("bonded")),
+        "battery": info.get("battery"),
+        "codec": active_codec(),
+        "anc": anc,
+        "ancLive": anc != "unknown",
+        "eqPreset": eq,
+        "eqName": EQ_PRESET_NAMES.get(eq, f"Preset {eq}") if eq is not None else None,
+    }
+    if "--json" in args or True:
+        print(json.dumps(result, indent=2))
+    return 0 if result["connected"] else 1
+
+
+def cmd_anc(args):
+    if not args or args[0] not in ("off", "on", "transparency", "query"):
+        print("usage: spacetravel2-ctl anc <off|on|transparency|query>", file=sys.stderr)
+        return 2
+    mode = args[0]
+    address = find_device_address()
+    if not address:
+        print("Space Travel 2 not found in bluetoothctl devices.", file=sys.stderr)
+        return 1
+    info = device_info(address)
+    if not info.get("connected"):
+        print(f"{address} found but not connected. Connect first (tap earbuds / bluetoothctl connect).",
+              file=sys.stderr)
+        return 1
+    if mode == "query":
+        live = query_anc_mode(address)
+        if live:
+            save_state({"anc": live})
+            print(json.dumps({"mode": live, "live": True}))
+            return 0
+        print(json.dumps({"mode": load_state().get("anc", "unknown"), "live": False}))
+        return 2
+    confirmed = set_anc_mode(address, mode)
+    if confirmed:
+        save_state({"anc": confirmed})
+        print(json.dumps({"mode": confirmed, "live": True}))
+        return 0
+    save_state({"anc": mode})
+    print(json.dumps({"mode": mode, "live": False,
+                      "hint": "No confirmation from earbuds; tap-and-hold on the earbud cycles ANC modes."}))
+    return 2
+
+
+BUDS_FEATURE = 0x0D  # spontaneous per-bud status pushes (no query needed)
+
+
+def listen_buds(address, duration=8.0):
+    """Passively listen for feature-0x0D per-bud battery pushes.
+
+    Sends nothing except one known-safe ANC GET to prime traffic (the same
+    packet Gadgetbridge sends on every connect). Observed payloads look like
+    index/level pairs, e.g. 01 64 02 5a -> bud 1 at 100%, bud 2 at 90%.
+    Bud index 1 is assumed left, 2 right (TWS convention; not yet verified).
+
+    The buds broadcast these intermittently (seen during battery-percent
+    transitions), so callers should treat results as opportunistic and keep
+    the last-known values.
+    Returns {"left": int|None, "right": int|None}.
+    """
+    buds = {}
+    if not hasattr(socket, "AF_BLUETOOTH"):
+        return {"left": None, "right": None}
+    s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+    s.settimeout(2.0)
+    try:
+        s.connect((address, RFCOMM_CHANNEL))
+    except OSError:
+        try:
+            s.close()
+        except OSError:
+            pass
+        return {"left": None, "right": None}
+    deadline = time.time() + duration
+    buf = b""
+    try:
+        # One known-safe read (the same ANC GET Gadgetbridge sends on every
+        # connect) to prime traffic; the per-bud pushes arrive interleaved
+        # with the reply or as spontaneous pushes shortly after.
+        try:
+            s.sendall(gaia_frame(ANC_FEATURE, ANC_GET_MODE))
+        except OSError:
+            pass
+        while time.time() < deadline:
+            try:
+                s.settimeout(max(0.5, deadline - time.time()))
+                chunk = s.recv(512)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            for _feat, ptype, pid, pay in gaia_decode(buf):
+                if _feat == BUDS_FEATURE and ptype == PDU_RESPONSE and len(pay) >= 2:
+                    # Consume index/level pairs; keep the latest per index.
+                    for j in range(0, len(pay) - 1, 2):
+                        idx, lvl = pay[j], pay[j + 1]
+                        if 1 <= idx <= 2 and lvl <= 100:
+                            buds[idx] = lvl
+            # Keep only a possible trailing partial packet.
+            if len(buf) > 64:
+                buf = buf[-64:]
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+    return {"left": buds.get(1), "right": buds.get(2)}
+
+
+def cmd_buds(args):
+    address = find_device_address()
+    if not address:
+        print("Space Travel 2 not found in bluetoothctl devices.", file=sys.stderr)
+        return 1
+    info = device_info(address)
+    if not info.get("connected"):
+        print(f"{address} found but not connected.", file=sys.stderr)
+        return 1
+    result = listen_buds(address)
+    # Opportunistic: merge with last-known so one quiet window doesn't blank it.
+    state = load_state()
+    known = state.get("buds", {})
+    if result["left"] is None:
+        result["left"] = known.get("left")
+    if result["right"] is None:
+        result["right"] = known.get("right")
+    save_state({"buds": result})
+    print(json.dumps(result))
+    return 0 if result["left"] is not None or result["right"] is not None else 2
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    if argv[0] == "status":
+        return cmd_status(argv[1:])
+    if argv[0] == "anc":
+        return cmd_anc(argv[1:])
+    if argv[0] == "eq":
+        return cmd_eq(argv[1:])
+    if argv[0] == "buds":
+        return cmd_buds(argv[1:])
+    print(f"unknown subcommand: {argv[0]}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

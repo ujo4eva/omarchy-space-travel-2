@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.ujo4eva.space-travel-2",
+  "name": "Space Travel 2",
+  "version": "0.1.0",
+  "author": "ujo4eva",
+  "license": "MIT",
+  "description": "Control Moondrop Space Travel 2 earbuds: ANC mode, per-bud battery and codec status.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Space Travel 2",
+    "description": "Moondrop Space Travel 2 status and ANC controls.",
+    "category": "Audio",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}
