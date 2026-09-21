@@ -278,15 +278,17 @@ def set_anc_mode(address, mode):
 
 def query_eq_preset(address):
     """Read the EQ preset byte (known-safe GET). Returns int or None."""
-    try:
-        with Gaialink(address) as link:
-            for feat, ptype, pid, pay in link.transact(
-                    gaia_frame(EQ_FEATURE, EQ_GET_PRESET)):
-                if (feat == EQ_FEATURE and ptype == PDU_RESPONSE
-                        and pid == EQ_GET_PRESET and len(pay) >= 1):
-                    return pay[0]
-    except OSError:
-        pass
+    for _attempt in range(2):
+        try:
+            with Gaialink(address) as link:
+                for feat, ptype, pid, pay in link.transact(
+                        gaia_frame(EQ_FEATURE, EQ_GET_PRESET)):
+                    if (feat == EQ_FEATURE and ptype == PDU_RESPONSE
+                            and pid == EQ_GET_PRESET and len(pay) >= 1):
+                        return pay[0]
+        except OSError:
+            pass
+        time.sleep(1.0)
     return None
 
 
