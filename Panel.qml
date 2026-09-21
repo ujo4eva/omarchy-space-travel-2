@@ -21,7 +21,7 @@ Panel {
   property var budRight: null
   property string lastError: ""
 
-  readonly property string barText: Model.barText(connected, anc, codec)
+  readonly property string barText: Model.barText(connected, anc)
   readonly property string heroSubtitle: Model.heroSubtitle(connected, address, battery, codec)
   function budLevel(v) { return (v === null || v === undefined) ? -1 : v }
 
@@ -105,9 +105,23 @@ Panel {
 
   // Hand off codec / headset-profile switching to the bt.codecs plugin
   // instead of duplicating its pactl logic here.
+  property bool codecsReady: false
+  property bool codecsBusy: false
+
   function openCodecs() {
     root.close()
     Quickshell.execDetached(["omarchy-shell", "shell", "summon", "bt.codecs", "{}"])
+  }
+
+  function checkCodecs() {
+    if (!checkProc.running) checkProc.running = true
+  }
+
+  function installCodecs() {
+    if (codecsBusy || installProc.running) return
+    codecsBusy = true
+    lastError = "Installing Bluetooth codec plugin…"
+    installProc.running = true
   }
 
   function ctlBase() {
@@ -162,14 +176,16 @@ Panel {
     if (selectedIndex === 0) setAnc("off")
     else if (selectedIndex === 1) setAnc("on")
     else if (selectedIndex === 2) setAnc("transparency")
-    else openCodecs()
+    else if (root.codecsReady) openCodecs()
+    else installCodecs()
   }
 
   function rowLabel(i) {
     if (i === 0) return "Noise cancelling off"
     if (i === 1) return "Noise cancelling on"
     if (i === 2) return "Transparency"
-    return "Audio codec…"
+    if (root.codecsReady) return "Audio codec…"
+    return "Install Bluetooth codec plugin…"
   }
 
   function rowActive(i) {
@@ -183,6 +199,7 @@ Panel {
     if (opened) {
       refresh()
       refreshBuds()
+      checkCodecs()
       cursorActive = false
       selectedIndex = 0
     }
@@ -227,6 +244,38 @@ Panel {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.parseBuds(text)
+    }
+  }
+
+  Process {
+    id: checkProc
+    command: ["omarchy", "plugin", "list", "--json"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var list = JSON.parse(String(text || "[]"))
+          var ok = false
+          for (var i = 0; i < list.length; i++) {
+            if (list[i] && list[i].id === "bt.codecs" && list[i].enabled) { ok = true; break }
+          }
+          root.codecsReady = ok
+        } catch (e) {}
+      }
+    }
+  }
+
+  Process {
+    id: installProc
+    command: ["omarchy", "plugin", "add", "https://github.com/nightdevil00/bt.codecs.git", "--enable", "--yes"]
+    onExited: function(exitCode) {
+      root.codecsBusy = false
+      if (exitCode === 0) {
+        root.lastError = ""
+        root.checkCodecs()
+      } else {
+        root.lastError = "Install failed — run: omarchy plugin add https://github.com/nightdevil00/bt.codecs.git --enable"
+      }
     }
   }
 
@@ -406,51 +455,67 @@ Panel {
           font.letterSpacing: 1.2
         }
 
+  component ModeRow: CursorSurface {
+    id: modeRow
+    required property int rowIdx
+    width: column.width
+    hasCursor: root.cursorActive && root.selectedIndex === rowIdx
+    current: root.rowActive(rowIdx)
+    foreground: root.bar.foreground
+    fill: root.hoverFill
+    currentFill: root.selectedFill
+    implicitHeight: rowText.implicitHeight + Style.spacing.xl
+
+    Text {
+      id: rowText
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(10)
+      text: (root.rowActive(modeRow.rowIdx) ? "● " : "○ ") + root.rowLabel(modeRow.rowIdx)
+      color: root.bar.foreground
+      font.family: root.bar.fontFamily
+      font.pixelSize: Style.font.body
+      elide: Text.ElideRight
+    }
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onContainsMouseChanged: if (containsMouse) {
+        root.cursorActive = true
+        root.selectedIndex = modeRow.rowIdx
+      }
+      onClicked: {
+        root.selectedIndex = modeRow.rowIdx
+        root.activateRow()
+      }
+    }
+  }
+
         Column {
           width: parent.width
           spacing: Style.space(6)
 
           Repeater {
-            model: root.rowCount
+            model: 3
+            delegate: ModeRow { required property int index; rowIdx: index }
+          }
+        }
 
-            delegate: CursorSurface {
-              required property int index
-              width: column.width
-              hasCursor: root.cursorActive && root.selectedIndex === index
-              current: root.rowActive(index)
-              foreground: root.bar.foreground
-              fill: root.hoverFill
-              currentFill: root.selectedFill
-              implicitHeight: rowText.implicitHeight + Style.spacing.xl
+        PanelSeparator {
+          foreground: root.bar.foreground
+        }
 
-              Text {
-                id: rowText
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                anchors.leftMargin: Style.space(10)
-                anchors.rightMargin: Style.space(10)
-                text: (root.rowActive(index) ? "● " : "○ ") + root.rowLabel(index)
-                color: root.bar.foreground
-                font.family: root.bar.fontFamily
-                font.pixelSize: Style.font.body
-                elide: Text.ElideRight
-              }
+        Column {
+          width: parent.width
+          spacing: Style.space(6)
 
-              MouseArea {
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onContainsMouseChanged: if (containsMouse) {
-                  root.cursorActive = true
-                  root.selectedIndex = index
-                }
-                onClicked: {
-                  root.selectedIndex = index
-                  root.activateRow()
-                }
-              }
-            }
+          Repeater {
+            model: 1
+            delegate: ModeRow { rowIdx: 3 }
           }
         }
 

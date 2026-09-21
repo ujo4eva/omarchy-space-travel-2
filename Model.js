@@ -5,11 +5,9 @@ function ancIcon(mode) {
   return "ST2"
 }
 
-function barText(connected, anc, codec) {
+function barText(connected, anc) {
   if (!connected) return "󰂲"
-  var label = ancIcon(anc)
-  if (codec) return "󰋋 " + label + " · " + codec
-  return "󰋋 " + label
+  return "󰋋 " + ancIcon(anc)
 }
 
 function heroSubtitle(connected, address, battery, codec) {
