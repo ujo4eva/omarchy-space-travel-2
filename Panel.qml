@@ -101,7 +101,14 @@ Panel {
 
   property int selectedIndex: 0
   property bool cursorActive: false
-  readonly property int rowCount: 3
+  readonly property int rowCount: 4
+
+  // Hand off codec / headset-profile switching to the bt.codecs plugin
+  // instead of duplicating its pactl logic here.
+  function openCodecs() {
+    root.close()
+    Quickshell.execDetached(["omarchy-shell", "shell", "summon", "bt.codecs", "{}"])
+  }
 
   function ctlBase() {
     return "spacetravel2-ctl"
@@ -154,19 +161,22 @@ Panel {
   function activateRow() {
     if (selectedIndex === 0) setAnc("off")
     else if (selectedIndex === 1) setAnc("on")
-    else setAnc("transparency")
+    else if (selectedIndex === 2) setAnc("transparency")
+    else openCodecs()
   }
 
   function rowLabel(i) {
     if (i === 0) return "Noise cancelling off"
     if (i === 1) return "Noise cancelling on"
-    return "Transparency"
+    if (i === 2) return "Transparency"
+    return "Audio codec…"
   }
 
   function rowActive(i) {
     if (i === 0) return anc === "off"
     if (i === 1) return anc === "on"
-    return anc === "transparency"
+    if (i === 2) return anc === "transparency"
+    return false
   }
 
   onOpenedChanged: {
